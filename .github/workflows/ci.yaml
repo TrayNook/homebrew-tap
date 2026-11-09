@@ -1,0 +1,58 @@
+name: Check casks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: cask-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  cask:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Stage all casks in a local tap
+        id: stage
+        run: |
+          shopt -s nullglob
+          casks=(Casks/*.rb)
+          if [[ ${#casks[@]} -eq 0 ]]; then
+            echo 'The first stable release will create the latest and versioned casks.'
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          brew tap-new --no-git traynook/ci
+          mkdir -p "$(brew --repository traynook/ci)/Casks"
+          cp "${casks[@]}" "$(brew --repository traynook/ci)/Casks/"
+          brew trust --tap traynook/ci
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+      - name: Check every cask's style and metadata
+        if: steps.stage.outputs.ready == 'true'
+        run: |
+          for cask in Casks/*.rb; do
+            token=$(basename "$cask" .rb)
+            brew style --cask "traynook/ci/$token"
+            # The built-in conflict audit clones all of homebrew/core.
+            status=$(curl --silent --show-error --location --retry 3 \
+              --connect-timeout 10 --max-time 30 --output /dev/null --write-out '%{http_code}' \
+              "https://formulae.brew.sh/api/formula/$token.json")
+            case "$status" in
+              404) ;;
+              200) echo "::error::The $token token conflicts with a core formula."; exit 1 ;;
+              *) echo "::error::Formula conflict check failed with HTTP $status."; exit 1 ;;
+            esac
+            brew audit --cask --strict --except token_conflicts "traynook/ci/$token"
+          done
